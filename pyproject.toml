@@ -1,0 +1,67 @@
+[tool.poetry]
+name = "gizmo"
+version = "0.1.0"
+description = "Graph-Integrated Zone of Metabolite Operations — metabolite-centered reaction graphs for cheminformatics and systems biology"
+authors = []
+license = "MIT"
+readme = "README.md"
+packages = [{ include = "gizmo" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+networkx = "^3.2"
+requests = "^2.31"
+pandas = "^2.0"
+numpy = "^1.26"
+lxml = "^5.0"
+pydantic = "^2.0"
+rich = "^13.0"
+obonet = ">=0.3"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-cov = "*"
+ruff = "*"
+mypy = "*"
+
+[tool.poetry.group.notebooks]
+optional = true
+
+[tool.poetry.group.notebooks.dependencies]
+jupyter = "*"
+matplotlib = "*"
+seaborn = "*"
+
+[tool.poetry.group.cheminformatics]
+optional = true
+
+[tool.poetry.group.cheminformatics.dependencies]
+rdkit = ">=2023.9"
+
+[tool.poetry.group.torch]
+optional = true
+
+[tool.poetry.group.torch.dependencies]
+torch = "^2.0"
+torch-geometric = "*"
+
+[tool.poetry.scripts]
+gizmo = "gizmo.cli:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
