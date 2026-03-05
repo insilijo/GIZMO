@@ -17,6 +17,7 @@ lxml = "^5.0"
 pydantic = "^2.0"
 rich = "^13.0"
 obonet = ">=0.3"
+ipykernel = "^7.2.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"

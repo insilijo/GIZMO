@@ -36,6 +36,47 @@ _FILES = {
 }
 
 
+def _mnx_header_info(path: Path) -> tuple[list[str], int]:
+    """
+    Scan a MetaNetX TSV and return (column_names, data_start_line).
+
+    MetaNetX files prefix their column-header row with '#' (e.g. '#ID\\t...')
+    alongside hundreds of other '#'-comment lines.  This function finds the
+    last '#'-prefixed line with ≥3 non-empty tab-separated fields whose first
+    field is a bare word — that is the column header.
+    """
+    header_cols: list[str] = []
+    data_start: int = 0
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh):
+            if line.startswith("#"):
+                parts = line[1:].rstrip("\n").split("\t")
+                non_empty = [p for p in parts if p.strip()]
+                if len(non_empty) >= 3 and parts[0] and " " not in parts[0]:
+                    header_cols = parts
+                    data_start = lineno + 1
+            else:
+                break
+    return header_cols, data_start
+
+
+def _read_mnx_tsv(path: Path) -> pd.DataFrame:
+    """
+    Read a MetaNetX flat-file TSV correctly.
+
+    MetaNetX files have hundreds of '#'-prefixed comment lines followed by a
+    column header that is *also* '#'-prefixed (e.g. '#ID\\tname\\t...' or
+    '#source\\tID\\t...').  Using pd.read_csv(comment='#') drops that header,
+    so the first data row becomes the column names — producing garbage.
+    """
+    header_cols, data_start = _mnx_header_info(path)
+    if not header_cols:
+        return pd.read_csv(path, sep="\t", comment="#", header=0, low_memory=False)
+    return pd.read_csv(
+        path, sep="\t", skiprows=data_start, header=None, names=header_cols, low_memory=False
+    )
+
+
 class MetaNetXClient:
     """
     Downloads and parses MetaNetX reference files for ID mapping and
@@ -69,13 +110,7 @@ class MetaNetXClient:
         path = self.cache_dir / _FILES[key]
         if not path.exists():
             raise FileNotFoundError(f"MetaNetX file not found: {path}. Run .download() first.")
-        return pd.read_csv(
-            path,
-            sep="\t",
-            comment="#",
-            header=0,
-            low_memory=False,
-        )
+        return _read_mnx_tsv(path)
 
     # ------------------------------------------------------------------
     # Compound cross-references

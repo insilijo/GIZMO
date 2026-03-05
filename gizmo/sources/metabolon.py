@@ -35,6 +35,7 @@ import pandas as pd
 import requests
 
 from gizmo.schema import MetaboliteNode
+from gizmo.sources.metanetx import _mnx_header_info
 
 log = logging.getLogger(__name__)
 
@@ -45,21 +46,29 @@ _PUBCHEM_REST = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/pr
 @dataclass
 class MatchReport:
     total: int = 0
-    exact_inchikey: int = 0
-    pubchem_inchikey: int = 0
+    exact_inchikey: int = 0        # InChIKey exact match via MetaNetX (local)
+    connectivity_inchikey: int = 0 # InChIKey connectivity-layer match via MetaNetX (local)
+    pubchem_mnx: int = 0           # PubChem CID match via MetaNetX chem_xref (local)
+    api_inchikey: int = 0          # InChIKey match via ChEBI OLS4 API
+    pubchem_inchikey: int = 0      # PubChem CID → InChIKey → ChEBI via API
     unmatched: int = 0
 
     @property
     def chebi_coverage(self) -> float:
         if self.total == 0:
             return 0.0
-        return (self.exact_inchikey + self.pubchem_inchikey) / self.total
+        matched = (self.exact_inchikey + self.connectivity_inchikey
+                   + self.pubchem_mnx + self.api_inchikey + self.pubchem_inchikey)
+        return matched / self.total
 
     def __str__(self) -> str:
         return (
             f"Metabolon mapping: {self.total} compounds | "
-            f"InChIKey hit: {self.exact_inchikey} | "
-            f"PubChem hit: {self.pubchem_inchikey} | "
+            f"InChIKey(exact): {self.exact_inchikey} | "
+            f"InChIKey(connectivity): {self.connectivity_inchikey} | "
+            f"PubChem(local): {self.pubchem_mnx} | "
+            f"InChIKey(API): {self.api_inchikey} | "
+            f"PubChem(API): {self.pubchem_inchikey} | "
             f"Unmatched: {self.unmatched} | "
             f"ChEBI coverage: {self.chebi_coverage*100:.1f}%"
         )
@@ -76,8 +85,12 @@ class MetabolonLoader:
     def __init__(self, csv_path: str | Path) -> None:
         self.csv_path = Path(csv_path)
         self._df: Optional[pd.DataFrame] = None
-        # InChIKey → ChEBI ID index (populated by load_metanetx_index)
+        # InChIKey → ChEBI ID (from MetaNetX chem_prop + chem_xref, exact match)
         self._inchikey_to_chebi: dict[str, str] = {}
+        # InChIKey connectivity prefix (14 chars) → ChEBI ID (fallback for stereoisomers)
+        self._connectivity_to_chebi: dict[str, str] = {}
+        # PubChem CID string → ChEBI ID (from MetaNetX chem_xref pubchem: entries)
+        self._pubchem_to_chebi: dict[str, str] = {}
         # MNX compound ID → ChEBI ID (from chem_xref)
         self._mnx_to_chebi: dict[str, str] = {}
 
@@ -92,12 +105,16 @@ class MetabolonLoader:
     ) -> int:
         """
         Build InChIKey → ChEBI lookup from MetaNetX flat files.
-        Returns number of indexed entries.
 
-        chem_prop.tsv columns (v4.x): ID, Description, Formula, Charge, Mass, InChI, InChIKey, SMILES
+        Streams both files line-by-line to avoid loading 700MB+ DataFrames.
+        Returns number of indexed InChIKey → ChEBI entries.
+
+        chem_prop.tsv columns (v4.x): ID, name, reference, formula, charge, mass, InChI, InChIKey, SMILES
         chem_xref.tsv columns: source, ID, description
-          (source looks like "chebi:CHEBI:15422")
+          (source looks like "chebi:CHEBI:15422" or "chebi:15422")
         """
+        import re
+
         chem_prop_path = Path(chem_prop_path)
         chem_xref_path = Path(chem_xref_path)
 
@@ -108,45 +125,88 @@ class MetabolonLoader:
             )
             return 0
 
-        # Load chem_xref to build MNX → ChEBI
-        xref_df = pd.read_csv(chem_xref_path, sep="\t", comment="#", header=0, low_memory=False)
-        # Find the ChEBI source column
-        chebi_rows = xref_df[xref_df.iloc[:, 0].str.startswith("chebi:", na=False)].copy()
-        if chebi_rows.empty:
+        # --- Pass 1: stream chem_xref ---
+        #   chebi: rows  → {MNX_ID: ChEBI_ID}
+        #   pubchem: rows → {pubchem_cid: MNX_ID}  (joined with chebi map after pass)
+        xref_cols, xref_start = _mnx_header_info(chem_xref_path)
+        # Typical columns: source (0), ID (1), description (2)
+        mnx_idx = xref_cols.index("ID") if "ID" in xref_cols else 1
+
+        mnx_to_chebi: dict[str, str] = {}
+        mnx_from_pubchem: dict[str, str] = {}   # pubchem_cid → mnx_id (temporary)
+        with open(chem_xref_path, encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh):
+                if lineno < xref_start:
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) <= mnx_idx:
+                    continue
+                source = parts[0]
+                mnx_id = parts[mnx_idx]
+                if source.startswith("chebi:"):
+                    # "chebi:CHEBI:15422" → "CHEBI:15422";  "chebi:15422" → "CHEBI:15422"
+                    chebi_id = "CHEBI:" + re.sub(r"^chebi:(?:CHEBI:)?", "", source)
+                    mnx_to_chebi[mnx_id] = chebi_id
+                elif source.startswith("pubchem:"):
+                    cid = source[8:]   # strip "pubchem:"
+                    mnx_from_pubchem[cid] = mnx_id
+
+        if not mnx_to_chebi:
             log.warning("No ChEBI entries found in chem_xref.tsv")
-        else:
-            # columns[0] = source (chebi:CHEBI:XXXXX), columns[1] = MNX ID
-            chebi_rows = chebi_rows.copy()
-            chebi_rows["chebi_id"] = chebi_rows.iloc[:, 0].str.replace(
-                r"^chebi:(?:CHEBI:)?", "CHEBI:", regex=True
-            )
-            mnx_col = chebi_rows.columns[1]
-            self._mnx_to_chebi = dict(zip(chebi_rows[mnx_col], chebi_rows["chebi_id"]))
+            return 0
 
-        # Load chem_prop to build InChIKey → MNX → ChEBI
-        prop_df = pd.read_csv(chem_prop_path, sep="\t", comment="#", header=0, low_memory=False)
-        # Find InChIKey column (varies by version: "InChIKey", "inchikey")
-        inchikey_col = next(
-            (c for c in prop_df.columns if c.lower() == "inchikey"), None
+        self._mnx_to_chebi = mnx_to_chebi
+        # Join pubchem → mnx with mnx → chebi to get pubchem → chebi
+        self._pubchem_to_chebi = {
+            cid: mnx_to_chebi[mid]
+            for cid, mid in mnx_from_pubchem.items()
+            if mid in mnx_to_chebi
+        }
+        log.info(
+            "chem_xref: %d MNX→ChEBI, %d PubChem→ChEBI entries",
+            len(mnx_to_chebi), len(self._pubchem_to_chebi),
         )
-        id_col = prop_df.columns[0]  # MNX ID column
 
-        if inchikey_col is None:
+        # --- Pass 2: stream chem_prop → build {InChIKey: ChEBI_ID} ---
+        prop_cols, prop_start = _mnx_header_info(chem_prop_path)
+
+        try:
+            id_idx = prop_cols.index("ID")
+        except ValueError:
+            id_idx = 0
+        try:
+            ik_idx = next(i for i, c in enumerate(prop_cols) if c.lower() == "inchikey")
+        except StopIteration:
             log.warning("No InChIKey column found in chem_prop.tsv")
             return 0
 
+        self._inchikey_to_chebi = {}
+        self._connectivity_to_chebi = {}
         count = 0
-        for _, row in prop_df.iterrows():
-            ik = row.get(inchikey_col)
-            mnx_id = row.get(id_col)
-            if pd.isna(ik) or pd.isna(mnx_id):
-                continue
-            chebi_id = self._mnx_to_chebi.get(mnx_id)
-            if chebi_id:
-                self._inchikey_to_chebi[str(ik)] = chebi_id
-                count += 1
+        with open(chem_prop_path, encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh):
+                if lineno < prop_start:
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) <= max(id_idx, ik_idx):
+                    continue
+                mnx_id = parts[id_idx]
+                inchikey = parts[ik_idx].strip()
+                if inchikey and mnx_id in mnx_to_chebi:
+                    chebi = mnx_to_chebi[mnx_id]
+                    self._inchikey_to_chebi[inchikey] = chebi
+                    # Connectivity prefix index (first 14 chars = connectivity layer).
+                    # Only store the first entry seen — gives a canonical ChEBI for
+                    # any stereoisomer / charge variant with the same skeleton.
+                    pfx = inchikey[:14]
+                    if pfx not in self._connectivity_to_chebi:
+                        self._connectivity_to_chebi[pfx] = chebi
+                    count += 1
 
-        log.info("MetaNetX InChIKey index: %d entries mapped to ChEBI", count)
+        log.info(
+            "MetaNetX index: %d exact InChIKey, %d connectivity prefix entries",
+            count, len(self._connectivity_to_chebi),
+        )
         return count
 
     # ------------------------------------------------------------------
@@ -207,17 +267,28 @@ class MetabolonLoader:
             matched_inchikey: Optional[str] = inchikey
             confidence = "unmatched"
 
-            # --- Match 1: MetaNetX InChIKey index ---
+            # --- Match 1: MetaNetX InChIKey exact (local) ---
             if inchikey and inchikey in self._inchikey_to_chebi:
                 chebi_id = self._inchikey_to_chebi[inchikey]
                 confidence = "exact_inchikey"
 
-            # --- Match 2: API fallback ---
+            # --- Match 1b: MetaNetX InChIKey connectivity layer (local) ---
+            # Catches stereoisomers / charge variants with the same carbon skeleton.
+            elif inchikey and len(inchikey) >= 14 and inchikey[:14] in self._connectivity_to_chebi:
+                chebi_id = self._connectivity_to_chebi[inchikey[:14]]
+                confidence = "connectivity_inchikey"
+
+            # --- Match 2: MetaNetX PubChem CID index (local) ---
+            elif pubchem_cid and pubchem_cid in self._pubchem_to_chebi:
+                chebi_id = self._pubchem_to_chebi[pubchem_cid]
+                confidence = "pubchem_mnx"
+
+            # --- Match 3: API fallback ---
             elif api_fallback:
                 if inchikey:
                     chebi_id = _chebi_from_inchikey_api(inchikey)
                     if chebi_id:
-                        confidence = "exact_inchikey"
+                        confidence = "api_inchikey"
 
                 if not chebi_id and pubchem_cid:
                     try:
@@ -257,10 +328,13 @@ class MetabolonLoader:
             nodes.append(node)
 
             if confidence == "exact_inchikey":
-                if "pubchem" in confidence:
-                    report.pubchem_inchikey += 1
-                else:
-                    report.exact_inchikey += 1
+                report.exact_inchikey += 1
+            elif confidence == "connectivity_inchikey":
+                report.connectivity_inchikey += 1
+            elif confidence == "pubchem_mnx":
+                report.pubchem_mnx += 1
+            elif confidence == "api_inchikey":
+                report.api_inchikey += 1
             elif confidence == "pubchem_inchikey":
                 report.pubchem_inchikey += 1
             else:
